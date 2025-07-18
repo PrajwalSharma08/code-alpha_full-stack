@@ -1,0 +1,101 @@
+##first we do this models.py##
+
+from django.contrib.auth.models import User
+from django.db import models
+
+class Post(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    content = models.TextField()
+    created = models.DateTimeField(auto_now_add=True)
+
+class Comment(models.Model):
+    post = models.ForeignKey(Post, on_delete=models.CASCADE)
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    content = models.TextField()
+    created = models.DateTimeField(auto_now_add=True)
+
+class Follow(models.Model):
+    follower = models.ForeignKey(User, on_delete=models.CASCADE, related_name='follower')
+    following = models.ForeignKey(User, on_delete=models.CASCADE, related_name='following')
+
+
+##second we do this views.py##
+python
+
+from django.shortcuts import render, redirect
+from .models import Post, Comment, Follow
+from django.contrib.auth.decorators import login_required
+
+@login_required
+def home(request):
+    posts = Post.objects.all().order_by('-created')
+    return render(request, 'home.html', {'posts': posts})
+
+@login_required
+def create_post(request):
+    if request.method == 'POST':
+        Post.objects.create(user=request.user, content=request.POST['content'])
+    return redirect('home')
+
+##third we do this urls.py (app level)##
+python
+
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path('', views.home, name='home'),
+    path('create/', views.create_post, name='create_post'),
+]
+
+##fourth we do this home.html (basic template)##
+html
+
+<html>
+<head>
+    <link rel="stylesheet" href="/static/style.css">
+    <title>Mini Social App</title>
+</head>
+<body>
+    <h2>Welcome, {{ user.username }}</h2>
+    <form method="POST" action="/create/">{% csrf_token %}
+        <textarea name="content" placeholder="Write something..."></textarea>
+        <button type="submit">Post</button>
+    </form>
+    <hr>
+    {% for post in posts %}
+        <p><strong>{{ post.user.username }}</strong>: {{ post.content }}</p>
+    {% endfor %}
+</body>
+</html>
+
+##fifth we do this style.css##
+css
+
+body {
+    font-family: Arial;
+    width: 50%;
+    margin: auto;
+}
+textarea {
+    width: 100%;
+    height: 60px;
+}
+button {
+    padding: 5px 10px;
+}
+
+##sixth we do this Database##Run:
+bash
+
+python manage.py makemigrations
+python manage.py migrate
+python manage.py createsuperuser
+
+
+##In the end we do this for Run Server##
+bash
+
+python manage.py runserver
+
+Visit: http://127.0.0.1:8000/
