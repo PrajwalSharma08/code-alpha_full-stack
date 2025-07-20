@@ -1,0 +1,327 @@
+Backend Structure (Django with Django Channels for WebSockets)
+1. Project Setup (Similar to Social Media App)
+
+Install Django, Django REST Framework, and channels.
+
+Bash
+
+pip install django djangorestframework channels
+Create project and apps: project_manager_project, users, projects, tasks, notifications.
+
+Add apps and channels to INSTALLED_APPS in settings.py.
+
+2. Database Models (models.py)
+
+users/models.py: (Re-use custom User model from Task 2)
+
+projects/models.py:
+
+Python
+
+from django.db import models
+from users.models import User # Your custom User model
+
+class Project(models.Model):
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True, null=True)
+    created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='created_projects')
+    members = models.ManyToManyField(User, related_name='member_of_projects', blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.name
+tasks/models.py:
+
+Python
+
+from django.db import models
+from users.models import User
+from projects.models import Project
+
+class Task(models.Model):
+    STATUS_CHOICES = [
+        ('todo', 'To Do'),
+        ('in_progress', 'In Progress'),
+        ('done', 'Done'),
+    ]
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='tasks')
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True, null=True)
+    assigned_to = models.ManyToManyField(User, related_name='assigned_tasks', blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='todo')
+    due_date = models.DateField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['due_date', 'created_at']
+
+    def __str__(self):
+        return self.title
+
+class TaskComment(models.Model):
+    task = models.ForeignKey(Task, on_delete=models.CASCADE, related_name='comments')
+    author = models.ForeignKey(User, on_delete=models.CASCADE, related_name='task_comments')
+    content = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+
+    def __str__(self):
+        return f"Comment by {self.author.username} on task {self.task.title}"
+notifications/models.py:
+
+Python
+
+from django.db import models
+from users.models import User
+from django.contrib.contenttypes.fields import GenericForeignKey
+from django.contrib.contenttypes.models import ContentType
+
+class Notification(models.Model):
+    recipient = models.ForeignKey(User, on_delete=models.CASCADE, related_name='notifications')
+    actor = models.ForeignKey(User, on_delete=models.CASCADE, related_name='initiated_notifications', null=True, blank=True)
+    verb = models.CharField(max_length=255) # e.g., 'assigned', 'commented on', 'updated'
+    action_object_content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE, related_name='action_object', null=True, blank=True)
+    action_object_object_id = models.PositiveIntegerField(null=True, blank=True)
+    action_object = GenericForeignKey('action_object_content_type', 'action_object_object_id')
+    target_content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE, related_name='target_object', null=True, blank=True)
+    target_object_object_id = models.PositiveIntegerField(null=True, blank=True)
+    target = GenericForeignKey('target_content_type', 'target_object_object_id')
+    read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.recipient.username} received: {self.actor.username if self.actor else 'System'} {self.verb} {self.action_object} on {self.target}"
+
+3. Serializers, Views, URLs (DRF)
+
+Similar patterns as the social media app, but for Projects, Tasks, and TaskComments.
+
+Project Serializer/View: CRUD for projects, managing members.
+
+Task Serializer/View: CRUD for tasks, assigning users, updating status.
+
+TaskComment Serializer/View: Create/list comments for a specific task.
+
+Notification Serializer/View: List/mark as read notifications for a user.
+
+4. WebSockets with Django Channels
+
+Install Redis: For Channels to use as a channel layer.
+
+settings.py:
+
+Python
+
+# settings.py
+# ...
+ASGI_APPLICATION = 'project_manager_project.asgi.application'
+
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels_redis.core.RedisChannelLayer',
+        'CONFIG': {
+            "hosts": [('127.0.0.1', 6379)], # Or your Redis server URL
+        },
+    },
+}
+# ...
+project_manager_project/asgi.py:
+
+Python
+
+# project_manager_project/asgi.py
+import os
+from channels.auth import AuthMiddlewareStack
+from channels.routing import ProtocolTypeRouter, URLRouter
+from channels.security.websocket import AllowedHostsOriginValidator
+from django.core.asgi import get_asgi_application
+
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'project_manager_project.settings')
+# Initialize Django ASGI application early to ensure the AppRegistry
+# is populated before importing code that may import ORM models.
+django_asgi_app = get_asgi_application()
+
+import notifications.routing # Your app's WebSocket routing
+
+application = ProtocolTypeRouter({
+    "http": django_asgi_app,
+    "websocket": AllowedHostsOriginValidator(
+        AuthMiddlewareStack(
+            URLRouter(
+                notifications.routing.websocket_urlpatterns
+            )
+        )
+    ),
+})
+
+notifications/consumers.py (WebSocket handlers):
+
+Python
+
+# notifications/consumers.py
+import json
+from channels.generic.websocket import AsyncWebsocketConsumer
+from asgiref.sync import sync_to_async
+from users.models import User
+from .serializers import NotificationSerializer
+from .models import Notification
+
+class NotificationConsumer(AsyncWebsocketConsumer):
+    async def connect(self):
+        self.user = self.scope["user"]
+        if self.user.is_authenticated:
+            self.user_group_name = f'user_{self.user.id}'
+            await self.channel_layer.group_add(
+                self.user_group_name,
+                self.channel_name
+            )
+            await self.accept()
+        else:
+            await self.close()
+
+    async def disconnect(self, close_code):
+        if self.user.is_authenticated:
+            await self.channel_layer.group_discard(
+                self.user_group_name,
+                self.channel_name
+            )
+
+    # Receive message from WebSocket
+    async def receive(self, text_data):
+        # No direct messages expected from client, primarily for sending notifications
+        pass
+
+    # Receive message from channel layer (e.g., from a DRF view after creating a task/comment)
+    async def send_notification(self, event):
+        notification_data = event['notification']
+        # Send message to WebSocket
+        await self.send(text_data=json.dumps({
+            'type': 'notification',
+            'notification': notification_data
+        }))
+
+# Helper function to send notification from regular Django views
+@sync_to_async
+def create_and_send_notification(recipient_id, actor_id, verb, action_object=None, target=None):
+    recipient = User.objects.get(id=recipient_id)
+    actor = User.objects.get(id=actor_id) if actor_id else None
+
+    notification = Notification.objects.create(
+        recipient=recipient,
+        actor=actor,
+        verb=verb,
+        action_object=action_object,
+        target=target
+    )
+    serializer = NotificationSerializer(notification)
+
+    from channels.layers import get_channel_layer
+    channel_layer = get_channel_layer()
+    group_name = f'user_{recipient.id}'
+
+    # Send event to the group
+    import asyncio
+    asyncio.run(channel_layer.group_send(
+        group_name,
+        {
+            'type': 'send_notification',
+            'notification': serializer.data
+        }
+    ))
+notifications/routing.py:
+
+Python
+
+# notifications/routing.py
+from django.urls import re_path
+
+from . import consumers
+
+websocket_urlpatterns = [
+    re_path(r'ws/notifications/$', consumers.NotificationConsumer.as_asgi()),
+]
+Triggering notifications from views:
+
+Python
+
+# Example in a task creation view (tasks/views.py)
+from django.contrib.contenttypes.models import ContentType
+from notifications.consumers import create_and_send_notification
+
+class TaskCreateView(...):
+    # ...
+    def perform_create(self, serializer):
+        task = serializer.save(created_by=self.request.user)
+        # Notify project members (excluding the creator)
+        for member in task.project.members.exclude(id=self.request.user.id):
+            create_and_send_notification.delay( # Use .delay() if using celery for async tasks
+                recipient_id=member.id,
+                actor_id=self.request.user.id,
+                verb=f'created a new task "{task.title}"',
+                action_object=task,
+                target=task.project # Target is the project
+            )
+5. Frontend (HTML, CSS, JavaScript with WebSockets)
+
+Structure: Similar to the social media app, but with more complex JS logic for managing project boards, drag-and-drop tasks, etc.
+
+WebSocket Connection:
+
+JavaScript
+
+// js/notifications.js
+let notificationSocket = null;
+
+function connectNotificationSocket() {
+    const accessToken = localStorage.getItem('accessToken');
+    if (!accessToken) {
+        console.log("No access token found, cannot connect to notifications.");
+        return;
+    }
+
+    notificationSocket = new WebSocket(
+        `ws://127.0.0.1:8000/ws/notifications/?token=${accessToken}` // Pass token for authentication
+    );
+
+    notificationSocket.onopen = function(e) {
+        console.log("Notification WebSocket connected.");
+    };
+
+    notificationSocket.onmessage = function(e) {
+        const data = JSON.parse(e.data);
+        if (data.type === 'notification') {
+            displayNotification(data.notification);
+        }
+    };
+
+    notificationSocket.onclose = function(e) {
+        console.log("Notification WebSocket disconnected. Attempting to reconnect...");
+        setTimeout(() => connectNotificationSocket(), 3000); // Reconnect after 3 seconds
+    };
+
+    notificationSocket.onerror = function(e) {
+        console.error("Notification WebSocket error:", e);
+    };
+}
+
+function displayNotification(notification) {
+    const notificationsArea = document.getElementById('notifications-area'); // A div to display notifications
+    if (notificationsArea) {
+        const notifElement = document.createElement('div');
+        notifElement.className = 'notification-item';
+        notifElement.innerHTML = `<p>${notification.actor_username || 'System'} ${notification.verb}</p>`;
+        notificationsArea.prepend(notifElement);
+        // Optionally, show a toast/pop-up
+    }
+}
+
+// Call this after successful login
+// connectNotificationSocket();
