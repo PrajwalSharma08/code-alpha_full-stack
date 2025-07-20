@@ -1,0 +1,1123 @@
+. Project Setup:
+
+Bash
+
+mkdir video-conf-app
+cd video-conf-app
+npm init -y
+npm install express socket.io jsonwebtoken bcryptjs dotenv cors
+2. Server File (server.js)
+
+JavaScript
+
+require('dotenv').config(); // Load environment variables from .env
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const cors = require('cors');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+    cors: {
+        origin: "*", // Allow all origins for development. Restrict in production.
+        methods: ["GET", "POST"]
+    }
+});
+
+app.use(cors());
+app.use(express.json()); // To parse JSON request bodies
+
+// --- Dummy User Storage (Replace with a proper database in production) ---
+const users = []; // { id: '...', username: '...', passwordHash: '...' }
+// --- End Dummy User Storage ---
+
+// --- Authentication Routes ---
+app.post('/api/register', async (req, res) => {
+    const { username, password } = req.body;
+    if (!username || !password) {
+        return res.status(400).json({ message: 'Username and password are required' });
+    }
+    if (users.find(u => u.username === username)) {
+        return res.status(409).json({ message: 'Username already exists' });
+    }
+    const passwordHash = await bcrypt.hash(password, 10);
+    const newUser = { id: users.length + 1, username, passwordHash };
+    users.push(newUser);
+    res.status(201).json({ message: 'User registered successfully' });
+});
+
+app.post('/api/login', async (req, res) => {
+    const { username, password } = req.body;
+    const user = users.find(u => u.username === username);
+    if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+        return res.status(401).json({ message: 'Invalid credentials' });
+    }
+    const token = jwt.sign({ id: user.id, username: user.username }, process.env.JWT_SECRET, { expiresIn: '1h' });
+    res.json({ message: 'Login successful', token });
+});
+
+// --- Middleware to authenticate Socket.io connections ---
+io.use((socket, next) => {
+    const token = socket.handshake.auth.token;
+    if (!token) {
+        return next(new Error('Authentication error: No token provided'));
+    }
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        socket.user = decoded; // Attach user info to the socket
+        next();
+    } catch (err) {
+        next(new Error('Authentication error: Invalid token'));
+    }
+});
+
+// --- Socket.io Signaling and Room Logic ---
+const activeRooms = {}; // { roomId: { users: { socketId: { userId, username, streamId } } } }
+
+io.on('connection', (socket) => {
+    console.log(`User connected: ${socket.id} (${socket.user.username})`);
+
+    socket.on('joinRoom', ({ roomId }) => {
+        if (!roomId) {
+            socket.emit('error', 'Room ID is required.');
+            return;
+        }
+
+        socket.join(roomId);
+        socket.roomId = roomId;
+        socket.peerId = socket.id; // Each socket is a peer for WebRTC
+
+        if (!activeRooms[roomId]) {
+            activeRooms[roomId] = { users: {} };
+        }
+        activeRooms[roomId].users[socket.id] = {
+            userId: socket.user.id,
+            username: socket.user.username,
+            streamId: null // Will be set once media stream is ready
+        };
+
+        // Notify others in the room about the new user
+        socket.to(roomId).emit('userJoined', {
+            peerId: socket.id,
+            username: socket.user.username,
+            userId: socket.user.id
+        });
+
+        // Send existing users in the room to the new user
+        const existingUsers = Object.entries(activeRooms[roomId].users)
+            .filter(([id, user]) => id !== socket.id)
+            .map(([id, user]) => ({ peerId: id, username: user.username, userId: user.userId }));
+        socket.emit('currentUsers', existingUsers);
+
+        console.log(`${socket.user.username} joined room: ${roomId}`);
+    });
+
+    // WebRTC Signaling
+    socket.on('offer', ({ sdp, receiverSocketId }) => {
+        io.to(receiverSocketId).emit('offer', { sdp, senderSocketId: socket.id });
+    });
+
+    socket.on('answer', ({ sdp, receiverSocketId }) => {
+        io.to(receiverSocketId).emit('answer', { sdp, senderSocketId: socket.id });
+    });
+
+    socket.on('iceCandidate', ({ candidate, receiverSocketId }) => {
+        io.to(receiverSocketId).emit('iceCandidate', { candidate, senderSocketId: socket.id });
+    });
+
+    // Media Stream ID Broadcast (once client has local stream)
+    socket.on('mediaStreamReady', ({ streamId }) => {
+        if (socket.roomId && activeRooms[socket.roomId] && activeRooms[socket.roomId].users[socket.id]) {
+            activeRooms[socket.roomId].users[socket.id].streamId = streamId;
+            socket.to(socket.roomId).emit('userMediaReady', { peerId: socket.id, streamId });
+        }
+    });
+
+    // Whiteboard Collaboration (basic implementation)
+    socket.on('draw', (data) => {
+        socket.to(socket.roomId).emit('draw', data); // Broadcast drawing data to all others in the room
+    });
+    socket.on('clearWhiteboard', () => {
+        socket.to(socket.roomId).emit('clearWhiteboard');
+    });
+
+    // File Sharing (metadata only, actual file via WebRTC DataChannel)
+    socket.on('fileOffer', ({ fileName, fileSize, fileType, receiverSocketId }) => {
+        io.to(receiverSocketId).emit('fileOffer', {
+            fileName,
+            fileSize,
+            fileType,
+            senderSocketId: socket.id,
+            senderUsername: socket.user.username
+        });
+    });
+
+    // Chat Messaging
+    socket.on('chatMessage', ({ message }) => {
+        if (socket.roomId) {
+            io.to(socket.roomId).emit('chatMessage', {
+                senderId: socket.user.id,
+                senderUsername: socket.user.username,
+                message,
+                timestamp: new Date().toISOString()
+            });
+        }
+    });
+
+    socket.on('disconnect', () => {
+        console.log(`User disconnected: ${socket.id} (${socket.user ? socket.user.username : 'Unknown'})`);
+        if (socket.roomId && activeRooms[socket.roomId]) {
+            const disconnectedUser = activeRooms[socket.roomId].users[socket.id];
+            delete activeRooms[socket.roomId].users[socket.id];
+
+            // Notify others in the room about the user leaving
+            socket.to(socket.roomId).emit('userLeft', { peerId: socket.id });
+
+            if (Object.keys(activeRooms[socket.roomId].users).length === 0) {
+                delete activeRooms[roomId]; // Clean up empty rooms
+            }
+        }
+    });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
+3. .env file:
+
+JWT_SECRET=your_very_secret_jwt_key_here
+II. Frontend (Plain HTML, CSS, JavaScript)
+This will be a single HTML file with embedded CSS and JavaScript for simplicity. In a real app, you'd split these.
+
+1. index.html
+
+HTML
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Video Conference</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <script src="https://cdn.socket.io/4.0.0/socket.io.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; display: flex; flex-direction: column; height: 100vh; margin: 0; background-color: #f0f2f5; }
+        #auth-container, #room-container {
+            max-width: 400px; margin: 50px auto; padding: 20px;
+            background-color: #fff; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        input, button { padding: 10px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; width: 100%; box-sizing: border-box; }
+        button { background-color: #007bff; color: white; cursor: pointer; border: none; }
+        button:hover { background-color: #0056b3; }
+        #video-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 10px;
+            padding: 10px;
+            flex-grow: 1;
+            overflow: auto;
+            background-color: #2c2f33; /* Dark background for videos */
+        }
+        .video-wrapper {
+            position: relative;
+            width: 100%;
+            height: 0;
+            padding-bottom: 75%; /* 4:3 aspect ratio */
+            background-color: black;
+            border-radius: 8px;
+            overflow: hidden;
+            border: 2px solid #555;
+        }
+        .video-wrapper video {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            object-fit: cover;
+            background-color: black;
+        }
+        .video-wrapper .username-label {
+            position: absolute;
+            bottom: 5px; left: 5px;
+            background-color: rgba(0,0,0,0.5);
+            color: white;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 0.8em;
+        }
+        #controls {
+            background-color: #36393f; /* Discord dark theme like */
+            padding: 10px;
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            border-top: 1px solid #444;
+        }
+        #controls button {
+            background-color: #4a4d51;
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 50px; height: 50px;
+            display: flex; justify-content: center; align-items: center;
+            font-size: 1.2em;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        #controls button:hover { background-color: #5d6065; }
+        #controls button.active { background-color: #28a745; } /* Green for active */
+        #controls button.danger { background-color: #dc3545; } /* Red for end call */
+
+        #whiteboard-container {
+            display: none; /* Hidden by default */
+            position: fixed;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            background-color: rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            justify-content: center; align-items: center;
+            flex-direction: column;
+        }
+        #whiteboard-canvas {
+            background-color: white;
+            border: 2px solid #333;
+            cursor: crosshair;
+        }
+        #whiteboard-controls {
+            margin-top: 10px;
+            display: flex;
+            gap: 10px;
+        }
+        #chat-sidebar {
+            width: 300px;
+            background-color: #36393f;
+            color: white;
+            display: flex;
+            flex-direction: column;
+            border-left: 1px solid #444;
+            display: none; /* Hidden by default */
+        }
+        #chat-messages {
+            flex-grow: 1;
+            overflow-y: auto;
+            padding: 10px;
+        }
+        #chat-input-container {
+            padding: 10px;
+            border-top: 1px solid #444;
+            display: flex;
+        }
+        #chat-input {
+            flex-grow: 1;
+            margin-right: 10px;
+            background-color: #4a4d51;
+            color: white;
+            border: none;
+        }
+        .chat-message {
+            margin-bottom: 5px;
+            padding: 5px;
+            border-radius: 4px;
+            background-color: #4a4d51;
+        }
+        .chat-message .sender {
+            font-weight: bold;
+            color: #7289da; /* Discord blue */
+        }
+    </style>
+</head>
+<body>
+
+    <div id="auth-container">
+        <h2>Auth</h2>
+        <input type="text" id="username" placeholder="Username">
+        <input type="password" id="password" placeholder="Password">
+        <button id="register-btn">Register</button>
+        <button id="login-btn">Login</button>
+        <p id="auth-message"></p>
+    </div>
+
+    <div id="room-container" style="display: none;">
+        <h2>Join Room</h2>
+        <input type="text" id="room-id" placeholder="Enter Room ID" value="test-room">
+        <button id="join-room-btn">Join Room</button>
+        <p id="room-message"></p>
+    </div>
+
+    <div style="display: flex; flex-grow: 1; display: none;" id="main-app">
+        <div style="display: flex; flex-direction: column; flex-grow: 1;">
+            <div id="video-grid">
+                <div class="video-wrapper">
+                    <video id="local-video" autoplay muted></video>
+                    <span class="username-label">You</span>
+                </div>
+            </div>
+
+            <div id="controls">
+                <button id="toggle-mic"><i class="fas fa-microphone"></i></button>
+                <button id="toggle-camera"><i class="fas fa-video"></i></button>
+                <button id="share-screen-btn"><i class="fas fa-desktop"></i></button>
+                <button id="whiteboard-btn"><i class="fas fa-paint-brush"></i></button>
+                <button id="file-share-btn"><i class="fas fa-file-upload"></i></button>
+                <button id="toggle-chat-btn"><i class="fas fa-comment-dots"></i></button>
+                <button id="leave-room-btn" class="danger"><i class="fas fa-phone-slash"></i></button>
+            </div>
+        </div>
+
+        <div id="chat-sidebar">
+            <h3>Chat</h3>
+            <div id="chat-messages"></div>
+            <div id="chat-input-container">
+                <input type="text" id="chat-input" placeholder="Type a message...">
+                <button id="send-chat-btn"><i class="fas fa-paper-plane"></i></button>
+            </div>
+        </div>
+    </div>
+
+    <div id="whiteboard-container">
+        <canvas id="whiteboard-canvas" width="800" height="600"></canvas>
+        <div id="whiteboard-controls">
+            <button id="clear-whiteboard-btn">Clear</button>
+            <input type="color" id="whiteboard-color" value="#000000">
+            <input type="range" id="whiteboard-brush-size" min="1" max="10" value="2">
+            <button id="close-whiteboard-btn">Close Whiteboard</button>
+        </div>
+    </div>
+
+
+    <script>
+        // --- Configuration ---
+        const API_BASE_URL = 'http://localhost:3000/api';
+        const SOCKET_IO_URL = 'http://localhost:3000';
+        const ICE_SERVERS = [
+            { urls: 'stun:stun.l.google.com:19302' },
+            // Add TURN server if needed for complex network environments
+            // { urls: 'turn:YOUR_TURN_SERVER_IP:3478', username: 'YOUR_USERNAME', credential: 'YOUR_PASSWORD' }
+        ];
+
+        // --- DOM Elements ---
+        const authContainer = document.getElementById('auth-container');
+        const usernameInput = document.getElementById('username');
+        const passwordInput = document.getElementById('password');
+        const registerBtn = document.getElementById('register-btn');
+        const loginBtn = document.getElementById('login-btn');
+        const authMessage = document.getElementById('auth-message');
+
+        const roomContainer = document.getElementById('room-container');
+        const roomIdInput = document.getElementById('room-id');
+        const joinRoomBtn = document.getElementById('join-room-btn');
+        const roomMessage = document.getElementById('room-message');
+
+        const mainAppDiv = document.getElementById('main-app');
+        const videoGrid = document.getElementById('video-grid');
+        const localVideo = document.getElementById('local-video');
+
+        const toggleMicBtn = document.getElementById('toggle-mic');
+        const toggleCameraBtn = document.getElementById('toggle-camera');
+        const shareScreenBtn = document.getElementById('share-screen-btn');
+        const whiteboardBtn = document.getElementById('whiteboard-btn');
+        const fileShareBtn = document.getElementById('file-share-btn');
+        const toggleChatBtn = document.getElementById('toggle-chat-btn');
+        const leaveRoomBtn = document.getElementById('leave-room-btn');
+
+        const chatSidebar = document.getElementById('chat-sidebar');
+        const chatMessagesDiv = document.getElementById('chat-messages');
+        const chatInput = document.getElementById('chat-input');
+        const sendChatBtn = document.getElementById('send-chat-btn');
+
+        const whiteboardContainer = document.getElementById('whiteboard-container');
+        const whiteboardCanvas = document.getElementById('whiteboard-canvas');
+        const whiteboardCtx = whiteboardCanvas.getContext('2d');
+        const clearWhiteboardBtn = document.getElementById('clear-whiteboard-btn');
+        const whiteboardColorInput = document.getElementById('whiteboard-color');
+        const whiteboardBrushSizeInput = document.getElementById('whiteboard-brush-size');
+        const closeWhiteboardBtn = document.getElementById('close-whiteboard-btn');
+
+
+        // --- Global State ---
+        let socket;
+        let localStream;
+        const peerConnections = {}; // { socketId: RTCPeerConnection }
+        const dataChannels = {};    // { socketId: RTCDataChannel }
+        let currentRoomId = null;
+        let isScreenSharing = false;
+        let originalCameraStream = null; // To restore camera after screen share
+        let currentBrushColor = whiteboardColorInput.value;
+        let currentBrushSize = whiteboardBrushSizeInput.value;
+        let isDrawing = false;
+        let lastX = 0;
+        let lastY = 0;
+
+        // --- Utility Functions ---
+        async function fetchWithAuth(url, options = {}) {
+            const token = localStorage.getItem('token');
+            const headers = {
+                'Content-Type': 'application/json',
+                ...options.headers
+            };
+            if (token) {
+                headers['Authorization'] = `Bearer ${token}`;
+            }
+            const response = await fetch(url, { ...options, headers });
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(errorData.message || 'API request failed');
+            }
+            return response.json();
+        }
+
+        function displayAuthMessage(message, isError = false) {
+            authMessage.textContent = message;
+            authMessage.style.color = isError ? 'red' : 'green';
+        }
+
+        function displayRoomMessage(message, isError = false) {
+            roomMessage.textContent = message;
+            roomMessage.style.color = isError ? 'red' : 'green';
+        }
+
+        function addVideoElement(id, stream, username) {
+            let videoWrapper = document.getElementById(`video-wrapper-${id}`);
+            if (!videoWrapper) {
+                videoWrapper = document.createElement('div');
+                videoWrapper.id = `video-wrapper-${id}`;
+                videoWrapper.className = 'video-wrapper';
+                videoGrid.appendChild(videoWrapper);
+
+                const video = document.createElement('video');
+                video.id = `video-${id}`;
+                video.autoplay = true;
+                video.playsInline = true;
+                videoWrapper.appendChild(video);
+
+                const usernameLabel = document.createElement('span');
+                usernameLabel.className = 'username-label';
+                usernameLabel.textContent = username || 'Unknown';
+                videoWrapper.appendChild(usernameLabel);
+            }
+            const videoElement = document.getElementById(`video-${id}`);
+            videoElement.srcObject = stream;
+        }
+
+        function removeVideoElement(id) {
+            const videoWrapper = document.getElementById(`video-wrapper-${id}`);
+            if (videoWrapper) {
+                videoWrapper.remove();
+            }
+        }
+
+        function setupPeerConnection(peerSocketId, isInitiator) {
+            const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+            peerConnections[peerSocketId] = pc;
+
+            // Add local tracks to peer connection
+            if (localStream) {
+                localStream.getTracks().forEach(track => {
+                    pc.addTrack(track, localStream);
+                });
+            }
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    socket.emit('iceCandidate', {
+                        candidate: event.candidate,
+                        receiverSocketId: peerSocketId
+                    });
+                }
+            };
+
+            pc.ontrack = (event) => {
+                console.log('Received remote stream:', event.streams[0]);
+                addVideoElement(peerSocketId, event.streams[0], 'Remote User'); // Username will be updated later
+            };
+
+            pc.onnegotiationneeded = async () => {
+                if (isInitiator) {
+                    try {
+                        const offer = await pc.createOffer();
+                        await pc.setLocalDescription(offer);
+                        socket.emit('offer', { sdp: pc.localDescription, receiverSocketId: peerSocketId });
+                    } catch (error) {
+                        console.error('Error creating offer:', error);
+                    }
+                }
+            };
+
+            // Setup Data Channel for whiteboard and file sharing
+            const dataChannel = pc.createDataChannel(`dataChannel-${socket.id}-${peerSocketId}`);
+            setupDataChannel(dataChannel, peerSocketId);
+
+            pc.ondatachannel = (event) => {
+                console.log('Remote data channel created:', event.channel.label);
+                setupDataChannel(event.channel, peerSocketId);
+            };
+
+            return pc;
+        }
+
+        function setupDataChannel(channel, peerSocketId) {
+            dataChannels[peerSocketId] = channel;
+            channel.onopen = () => console.log(`Data Channel with ${peerSocketId} opened.`);
+            channel.onclose = () => console.log(`Data Channel with ${peerSocketId} closed.`);
+            channel.onerror = (error) => console.error(`Data Channel error with ${peerSocketId}:`, error);
+
+            channel.onmessage = (event) => {
+                const message = JSON.parse(event.data);
+                if (message.type === 'draw') {
+                    handleRemoteDraw(message.data);
+                } else if (message.type === 'clearWhiteboard') {
+                    clearWhiteboardCanvas();
+                } else if (message.type === 'fileChunk') {
+                    receiveFileChunk(message.data, peerSocketId);
+                } else if (message.type === 'fileEnd') {
+                    receiveFileEnd(message.data, peerSocketId);
+                }
+                // Add handlers for other data channel messages (e.g., chat if not using Socket.io for chat)
+            };
+        }
+
+        // --- WebRTC Logic ---
+        async function startLocalStream() {
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                localVideo.srcObject = localStream;
+                toggleMicBtn.classList.add('active');
+                toggleCameraBtn.classList.add('active');
+            } catch (error) {
+                console.error('Error getting user media:', error);
+                alert('Could not access camera or microphone. Please check permissions.');
+            }
+        }
+
+        async function startScreenShare() {
+            if (isScreenSharing) {
+                stopScreenShare();
+                return;
+            }
+            try {
+                originalCameraStream = localStream; // Save current camera stream
+                const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+                isScreenSharing = true;
+                toggleMicBtn.classList.remove('active'); // Mute local mic during screen share (optional)
+                toggleCameraBtn.classList.remove('active'); // Stop local camera during screen share
+
+                // Replace tracks for all peer connections
+                for (const peerId in peerConnections) {
+                    const pc = peerConnections[peerId];
+                    // Remove existing video/audio tracks
+                    pc.getSenders().forEach(sender => {
+                        if (sender.track && (sender.track.kind === 'video' || sender.track.kind === 'audio')) {
+                            pc.removeTrack(sender);
+                        }
+                    });
+                    // Add new screen share tracks
+                    screenStream.getTracks().forEach(track => pc.addTrack(track, screenStream));
+                }
+                localStream = screenStream; // Update localStream to screen stream
+                localVideo.srcObject = localStream; // Show screen share locally
+                shareScreenBtn.classList.add('active');
+
+                // Listen for screen share end
+                screenStream.getVideoTracks()[0].onended = () => {
+                    stopScreenShare();
+                };
+            } catch (error) {
+                console.error('Error sharing screen:', error);
+                alert('Could not share screen. User denied or error occurred.');
+                isScreenSharing = false;
+                toggleMicBtn.classList.add('active'); // Re-enable if screen share fails
+                toggleCameraBtn.classList.add('active'); // Re-enable if screen share fails
+            }
+        }
+
+        function stopScreenShare() {
+            if (isScreenSharing) {
+                localStream.getTracks().forEach(track => track.stop()); // Stop screen sharing tracks
+                isScreenSharing = false;
+                shareScreenBtn.classList.remove('active');
+
+                // Restore camera stream if it was active before screen sharing
+                if (originalCameraStream) {
+                    localStream = originalCameraStream;
+                    localVideo.srcObject = localStream;
+                    localStream.getTracks().forEach(track => {
+                        if (track.kind === 'audio' && !track.enabled) {
+                            track.enabled = true; // Unmute audio if it was muted
+                            toggleMicBtn.classList.add('active');
+                        }
+                        if (track.kind === 'video' && !track.enabled) {
+                            track.enabled = true; // Unmute video if it was muted
+                            toggleCameraBtn.classList.add('active');
+                        }
+                    });
+                    // Replace tracks for all peer connections with original camera stream
+                    for (const peerId in peerConnections) {
+                        const pc = peerConnections[peerId];
+                        pc.getSenders().forEach(sender => {
+                            if (sender.track && (sender.track.kind === 'video' || sender.track.kind === 'audio')) {
+                                pc.removeTrack(sender);
+                            }
+                        });
+                        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+                    }
+                } else {
+                    // If no original camera stream, just stop all local tracks
+                    localVideo.srcObject = null;
+                    localStream = null;
+                }
+            }
+        }
+
+        function toggleMic() {
+            if (localStream) {
+                const audioTrack = localStream.getAudioTracks()[0];
+                if (audioTrack) {
+                    audioTrack.enabled = !audioTrack.enabled;
+                    toggleMicBtn.classList.toggle('active', audioTrack.enabled);
+                }
+            }
+        }
+
+        function toggleCamera() {
+            if (localStream) {
+                const videoTrack = localStream.getVideoTracks()[0];
+                if (videoTrack) {
+                    videoTrack.enabled = !videoTrack.enabled;
+                    toggleCameraBtn.classList.toggle('active', videoTrack.enabled);
+                }
+            }
+        }
+
+        // --- Socket.io Event Handlers ---
+        function setupSocketListeners() {
+            socket.on('connect', () => {
+                console.log('Socket.io connected:', socket.id);
+            });
+
+            socket.on('disconnect', () => {
+                console.log('Socket.io disconnected.');
+                // Clean up connections
+                for (const peerId in peerConnections) {
+                    peerConnections[peerId].close();
+                    removeVideoElement(peerId);
+                }
+                peerConnections = {};
+                dataChannels = {};
+                if (localStream) {
+                    localStream.getTracks().forEach(track => track.stop());
+                    localStream = null;
+                }
+                localVideo.srcObject = null;
+            });
+
+            socket.on('error', (message) => {
+                console.error('Socket.io error:', message);
+                alert('Socket error: ' + message);
+                localStorage.removeItem('token'); // Likely auth error
+                authContainer.style.display = 'block';
+                roomContainer.style.display = 'none';
+                mainAppDiv.style.display = 'none';
+                displayAuthMessage(message, true);
+            });
+
+            socket.on('currentUsers', async (users) => {
+                console.log('Current users in room:', users);
+                // For each existing user, create an offer
+                for (const user of users) {
+                    const pc = setupPeerConnection(user.peerId, true); // True because we initiate offer
+                    // If localStream is already set, add tracks here
+                    if (localStream) {
+                         localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+                    }
+                    try {
+                        const offer = await pc.createOffer();
+                        await pc.setLocalDescription(offer);
+                        socket.emit('offer', { sdp: pc.localDescription, receiverSocketId: user.peerId });
+                    } catch (error) {
+                        console.error('Error creating offer for existing user:', error);
+                    }
+                    // Add video element placeholder for remote users (stream will come later)
+                    addVideoElement(user.peerId, null, user.username);
+                }
+            });
+
+            socket.on('userJoined', ({ peerId, username, userId }) => {
+                console.log(`User joined: ${username} (${peerId})`);
+                const pc = setupPeerConnection(peerId, false); // False because they will send us an offer
+                addVideoElement(peerId, null, username);
+            });
+
+            socket.on('userLeft', ({ peerId }) => {
+                console.log(`User left: ${peerId}`);
+                if (peerConnections[peerId]) {
+                    peerConnections[peerId].close();
+                    delete peerConnections[peerId];
+                }
+                if (dataChannels[peerId]) {
+                    dataChannels[peerId].close();
+                    delete dataChannels[peerId];
+                }
+                removeVideoElement(peerId);
+            });
+
+            socket.on('offer', async ({ sdp, senderSocketId }) => {
+                console.log('Received offer from:', senderSocketId);
+                const pc = peerConnections[senderSocketId] || setupPeerConnection(senderSocketId, false);
+                await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                socket.emit('answer', { sdp: pc.localDescription, receiverSocketId: senderSocketId });
+            });
+
+            socket.on('answer', async ({ sdp, senderSocketId }) => {
+                console.log('Received answer from:', senderSocketId);
+                const pc = peerConnections[senderSocketId];
+                if (pc) {
+                    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+                }
+            });
+
+            socket.on('iceCandidate', async ({ candidate, senderSocketId }) => {
+                const pc = peerConnections[senderSocketId];
+                if (pc && candidate) {
+                    try {
+                        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+                    } catch (e) {
+                        console.error('Error adding received ICE candidate:', e);
+                    }
+                }
+            });
+
+            // Chat Messages
+            socket.on('chatMessage', ({ senderUsername, message, timestamp }) => {
+                addChatMessage(senderUsername, message, timestamp);
+            });
+
+            // Whiteboard events
+            socket.on('draw', (data) => {
+                handleRemoteDraw(data);
+            });
+            socket.on('clearWhiteboard', () => {
+                clearWhiteboardCanvas();
+            });
+
+            // File Sharing offers (actual file transfer via DataChannel)
+            socket.on('fileOffer', ({ fileName, fileSize, fileType, senderSocketId, senderUsername }) => {
+                const confirmDownload = confirm(`User ${senderUsername} wants to send "${fileName}" (${(fileSize / 1024 / 1024).toFixed(2)} MB). Do you want to accept?`);
+                if (confirmDownload) {
+                    // Prepare to receive, create data channel listener for this file
+                    // This is a simplified acceptance. In a real app, you'd manage multiple file transfers.
+                    fileTransferStates[senderSocketId] = {
+                        chunks: [],
+                        receivedSize: 0,
+                        fileName: fileName,
+                        fileType: fileType,
+                        totalSize: fileSize
+                    };
+                    alert(`Accepted file offer from ${senderUsername}. Transfer will start.`);
+                } else {
+                    alert(`Declined file offer from ${senderUsername}.`);
+                    // Optionally, send a rejection message back
+                }
+            });
+        }
+
+        // --- Auth & Room Joining ---
+        registerBtn.addEventListener('click', async () => {
+            try {
+                await fetchWithAuth(`${API_BASE_URL}/register`, {
+                    method: 'POST',
+                    body: JSON.stringify({ username: usernameInput.value, password: passwordInput.value })
+                });
+                displayAuthMessage('Registration successful! Please login.');
+            } catch (error) {
+                displayAuthMessage(`Registration failed: ${error.message}`, true);
+            }
+        });
+
+        loginBtn.addEventListener('click', async () => {
+            try {
+                const data = await fetchWithAuth(`${API_BASE_URL}/login`, {
+                    method: 'POST',
+                    body: JSON.stringify({ username: usernameInput.value, password: passwordInput.value })
+                });
+                localStorage.setItem('token', data.token);
+                displayAuthMessage('Login successful!');
+                authContainer.style.display = 'none';
+                roomContainer.style.display = 'block';
+                // Connect Socket.io after successful login
+                socket = io(SOCKET_IO_URL, {
+                    auth: { token: localStorage.getItem('token') }
+                });
+                setupSocketListeners();
+            } catch (error) {
+                displayAuthMessage(`Login failed: ${error.message}`, true);
+            }
+        });
+
+        joinRoomBtn.addEventListener('click', async () => {
+            currentRoomId = roomIdInput.value.trim();
+            if (!currentRoomId) {
+                displayRoomMessage('Please enter a Room ID', true);
+                return;
+            }
+
+            if (!localStream) {
+                await startLocalStream();
+            }
+            if (!localStream) { // If stream still null after attempt
+                displayRoomMessage('Failed to get local media stream. Cannot join room.', true);
+                return;
+            }
+
+            socket.emit('joinRoom', { roomId: currentRoomId });
+            roomContainer.style.display = 'none';
+            mainAppDiv.style.display = 'flex';
+            addVideoElement('local-video', localStream, 'You'); // Add local video to grid
+        });
+
+        leaveRoomBtn.addEventListener('click', () => {
+            if (socket) {
+                socket.disconnect(); // This will trigger 'disconnect' event on server
+            }
+            // Reset UI and state
+            mainAppDiv.style.display = 'none';
+            roomContainer.style.display = 'block';
+            localVideo.srcObject = null;
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+            // Clear all remote videos
+            Array.from(videoGrid.children).forEach(child => {
+                if (child.id !== 'video-wrapper-local-video') {
+                    child.remove();
+                }
+            });
+            // Clear chat and whiteboard
+            chatMessagesDiv.innerHTML = '';
+            whiteboardContainer.style.display = 'none';
+            clearWhiteboardCanvas();
+            toggleMicBtn.classList.remove('active');
+            toggleCameraBtn.classList.remove('active');
+            shareScreenBtn.classList.remove('active');
+        });
+
+        // --- Controls ---
+        toggleMicBtn.addEventListener('click', toggleMic);
+        toggleCameraBtn.addEventListener('click', toggleCamera);
+        shareScreenBtn.addEventListener('click', startScreenShare);
+
+        // --- Chat Logic ---
+        function addChatMessage(sender, message, timestamp) {
+            const messageElement = document.createElement('div');
+            messageElement.className = 'chat-message';
+            const date = new Date(timestamp);
+            messageElement.innerHTML = `<span class="sender">${sender}</span> <small>(${date.toLocaleTimeString()})</small>: ${message}`;
+            chatMessagesDiv.appendChild(messageElement);
+            chatMessagesDiv.scrollTop = chatMessagesDiv.scrollHeight; // Scroll to bottom
+        }
+
+        sendChatBtn.addEventListener('click', () => {
+            const message = chatInput.value.trim();
+            if (message) {
+                socket.emit('chatMessage', { message, roomId: currentRoomId });
+                chatInput.value = '';
+            }
+        });
+
+        chatInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                sendChatBtn.click();
+            }
+        });
+
+        toggleChatBtn.addEventListener('click', () => {
+            chatSidebar.style.display = chatSidebar.style.display === 'flex' ? 'none' : 'flex';
+        });
+
+        // --- Whiteboard Logic ---
+        whiteboardBtn.addEventListener('click', () => {
+            whiteboardContainer.style.display = 'flex';
+            // Set canvas size (important for drawing coordinates)
+            whiteboardCanvas.width = 800; // window.innerWidth * 0.8;
+            whiteboardCanvas.height = 600; // window.innerHeight * 0.8;
+            clearWhiteboardCanvas(); // Clear when opening
+        });
+
+        closeWhiteboardBtn.addEventListener('click', () => {
+            whiteboardContainer.style.display = 'none';
+        });
+
+        clearWhiteboardBtn.addEventListener('click', () => {
+            clearWhiteboardCanvas();
+            socket.emit('clearWhiteboard', { roomId: currentRoomId }); // Notify others to clear
+        });
+
+        whiteboardColorInput.addEventListener('change', (e) => {
+            currentBrushColor = e.target.value;
+        });
+
+        whiteboardBrushSizeInput.addEventListener('change', (e) => {
+            currentBrushSize = e.target.value;
+        });
+
+        function clearWhiteboardCanvas() {
+            whiteboardCtx.clearRect(0, 0, whiteboardCanvas.width, whiteboardCanvas.height);
+        }
+
+        function drawLine(x1, y1, x2, y2, color, size) {
+            whiteboardCtx.beginPath();
+            whiteboardCtx.moveTo(x1, y1);
+            whiteboardCtx.lineTo(x2, y2);
+            whiteboardCtx.strokeStyle = color;
+            whiteboardCtx.lineWidth = size;
+            whiteboardCtx.lineCap = 'round';
+            whiteboardCtx.stroke();
+            whiteboardCtx.closePath();
+        }
+
+        function handleRemoteDraw(data) {
+            drawLine(data.x1, data.y1, data.x2, data.y2, data.color, data.size);
+        }
+
+        whiteboardCanvas.addEventListener('mousedown', (e) => {
+            isDrawing = true;
+            [lastX, lastY] = [e.offsetX, e.offsetY];
+        });
+
+        whiteboardCanvas.addEventListener('mousemove', (e) => {
+            if (!isDrawing) return;
+            drawLine(lastX, lastY, e.offsetX, e.offsetY, currentBrushColor, currentBrushSize);
+            // Send drawing data to others via Socket.io
+            socket.emit('draw', {
+                roomId: currentRoomId,
+                x1: lastX, y1: lastY,
+                x2: e.offsetX, y2: e.offsetY,
+                color: currentBrushColor,
+                size: currentBrushSize
+            });
+            [lastX, lastY] = [e.offsetX, e.offsetY];
+        });
+
+        whiteboardCanvas.addEventListener('mouseup', () => {
+            isDrawing = false;
+        });
+
+        whiteboardCanvas.addEventListener('mouseout', () => {
+            isDrawing = false;
+        });
+
+        // --- File Sharing Logic (via WebRTC DataChannel) ---
+        // This is a simplified single file transfer for demonstration
+        const CHUNK_SIZE = 16 * 1024; // 16 KB chunks
+        const fileTransferStates = {}; // { peerSocketId: { chunks: [], receivedSize: 0, fileName: '', fileType: '', totalSize: 0 } }
+
+        fileShareBtn.addEventListener('click', async () => {
+            const fileInput = document.createElement('input');
+            fileInput.type = 'file';
+            fileInput.onchange = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                // Send file offer metadata to all peers via Socket.io
+                for (const peerId in peerConnections) {
+                    socket.emit('fileOffer', {
+                        fileName: file.name,
+                        fileSize: file.size,
+                        fileType: file.type,
+                        receiverSocketId: peerId // Send to specific peer
+                    });
+                }
+
+                // Wait for confirmation to start sending (simplified for now)
+                // For a robust system, implement an offer/accept flow before sending
+                setTimeout(async () => { // Simulate waiting for acceptance
+                    // Iterate through each data channel and send the file
+                    for (const peerId in dataChannels) {
+                        const dc = dataChannels[peerId];
+                        if (dc.readyState === 'open') {
+                            console.log(`Sending file ${file.name} to ${peerId}`);
+                            let offset = 0;
+                            const reader = new FileReader();
+
+                            reader.onload = (event) => {
+                                const chunk = event.target.result;
+                                dc.send(JSON.stringify({ type: 'fileChunk', data: chunk }));
+                                offset += chunk.byteLength;
+                                if (offset < file.size) {
+                                    readNextChunk();
+                                } else {
+                                    dc.send(JSON.stringify({ type: 'fileEnd', data: { fileName: file.name, fileType: file.type } }));
+                                    alert(`File ${file.name} sent to ${peerId}!`);
+                                }
+                            };
+
+                            const readNextChunk = () => {
+                                const slice = file.slice(offset, offset + CHUNK_SIZE);
+                                reader.readAsArrayBuffer(slice);
+                            };
+
+                            readNextChunk();
+                        } else {
+                            console.warn(`Data channel with ${peerId} not open for file transfer.`);
+                        }
+                    }
+                }, 1000); // Small delay to simulate offer/accept
+            };
+            fileInput.click();
+        });
+
+        function receiveFileChunk(chunk, senderSocketId) {
+            const state = fileTransferStates[senderSocketId];
+            if (!state) return;
+            state.chunks.push(chunk);
+            state.receivedSize += chunk.byteLength || chunk.length; // ArrayBuffer might not have byteLength directly
+            console.log(`Receiving file from ${senderSocketId}: ${(state.receivedSize / state.totalSize * 100).toFixed(2)}%`);
+        }
+
+        function receiveFileEnd(data, senderSocketId) {
+            const state = fileTransferStates[senderSocketId];
+            if (!state) return;
+
+            const fullBlob = new Blob(state.chunks, { type: state.fileType });
+            const downloadUrl = URL.createObjectURL(fullBlob);
+
+            const a = document.createElement('a');
+            a.href = downloadUrl;
+            a.download = state.fileName;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(downloadUrl);
+
+            alert(`File "${state.fileName}" received successfully!`);
+            delete fileTransferStates[senderSocketId]; // Clean up state
+        }
+
+
+        // --- Initial Load ---
+        document.addEventListener('DOMContentLoaded', () => {
+            const token = localStorage.getItem('token');
+            if (token) {
+                // Attempt to connect socket if token exists (e.g., refreshing page)
+                socket = io(SOCKET_IO_URL, {
+                    auth: { token: token }
+                });
+                setupSocketListeners();
+                authContainer.style.display = 'none';
+                roomContainer.style.display = 'block';
+            } else {
+                authContainer.style.display = 'block';
+                roomContainer.style.display = 'none';
+                mainAppDiv.style.display = 'none';
+            }
+        });
+
+    </script>
+</body>
+</html>
